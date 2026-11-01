@@ -1,0 +1,13 @@
+.venv/
+.env
+__pycache__/
+.pytest_cache/
+*.pyc
+*.log
+debug/
+.DS_Store
+.ruff_cache/
+.live-profile/
+.tmp-profile/
+.live-debug/
+.tmp-debug/
