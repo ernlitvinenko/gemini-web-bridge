@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Gemini Web Mock</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; }
+    [hidden] { display: none !important; }
+    gem-menu-item { display: block; padding: 6px 12px; cursor: pointer; border: 1px solid #ddd; }
+    rich-textarea { display: block; border: 1px solid #999; min-height: 60px; margin: 12px 0; }
+    .ql-editor { min-height: 48px; padding: 8px; }
+    #responses { margin-top: 20px; }
+    model-response { display: block; border-top: 1px solid #ddd; padding-top: 12px; margin-top: 12px; }
+    pre { background: #f4f4f4; padding: 8px; }
+  </style>
+</head>
+<body>
+  <div id="signin-slot"></div>
+
+  <button data-test-id="bard-mode-menu-button" id="mode-button" aria-label="Open mode picker, currently Flash">
+    <span id="model-label">3.6 Flash</span>
+  </button>
+
+  <div id="mode-menu" role="menu" hidden>
+    <gem-menu-item role="menuitem" data-label="Flash">3.6 Flash<br>All-around help</gem-menu-item>
+    <gem-menu-item role="menuitem" data-label="Pro">3.1 Pro<br>Advanced reasoning</gem-menu-item>
+    <gem-menu-item role="menuitem" data-label="Flash-Lite">3.5 Flash-Lite<br>Fastest answers</gem-menu-item>
+    <gem-menu-item role="menuitem" data-test-id="mode-picker-sign-in-button">Sign in for all models<br>Try the latest Flash</gem-menu-item>
+  </div>
+
+  <rich-textarea>
+    <div class="ql-editor" contenteditable="true" role="textbox" aria-label="Enter a prompt"></div>
+  </rich-textarea>
+
+  <div data-test-id="send-button-container">
+    <button id="send" aria-label="Send message">Send</button>
+    <button id="stop" data-test-id="stop-button" aria-label="Stop response" hidden>Stop</button>
+  </div>
+
+  <div id="responses"></div>
+
+  <script>
+    const params = new URLSearchParams(location.search);
+    if (params.get("signin") === "1") {
+      const signIn = document.createElement("button");
+      signIn.setAttribute("data-test-id", "sign-in-button");
+      signIn.textContent = "Sign in";
+      document.getElementById("signin-slot").appendChild(signIn);
+    }
+
+    const modeButton = document.getElementById("mode-button");
+    const modelLabel = document.getElementById("model-label");
+    const modeMenu = document.getElementById("mode-menu");
+    const editor = document.querySelector(".ql-editor");
+    const send = document.getElementById("send");
+    const stop = document.getElementById("stop");
+    const responses = document.getElementById("responses");
+    let currentModel = "3.6 Flash";
+
+    modeButton.addEventListener("click", () => {
+      modeMenu.hidden = !modeMenu.hidden;
+    });
+
+    for (const item of modeMenu.querySelectorAll("gem-menu-item")) {
+      item.addEventListener("click", () => {
+        if (item.getAttribute("data-test-id") === "mode-picker-sign-in-button") return;
+        currentModel = item.getAttribute("data-label");
+        modelLabel.textContent = "3.6 " + currentModel;
+        modeMenu.hidden = true;
+      });
+    }
+
+    function escapeHtml(text) {
+      return text.replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+
+    send.addEventListener("click", () => {
+      const prompt = editor.innerText.trim();
+      if (!prompt) return;
+      editor.innerHTML = "";
+      const response = document.createElement("model-response");
+      const message = document.createElement("message-content");
+      const markdown = document.createElement("div");
+      markdown.className = "markdown markdown-main-panel";
+      message.appendChild(markdown);
+      const footer = document.createElement("div");
+      footer.className = "response-footer animated gap";
+      response.appendChild(message);
+      response.appendChild(footer);
+      responses.appendChild(response);
+      stop.hidden = false;
+
+      markdown.innerHTML = "<p>Working on it...</p>";
+      setTimeout(() => {
+        markdown.innerHTML =
+          "<h2>Answer</h2>" +
+          "<p>Mode: <strong>" + currentModel + "</strong></p>" +
+          "<p>Prompt: " + escapeHtml(prompt) + "</p>" +
+          "<p>Streaming tail...</p>";
+      }, 250);
+      setTimeout(() => {
+        markdown.innerHTML =
+          "<h2>Answer</h2>" +
+          "<p>Mode: <strong>" + currentModel + "</strong></p>" +
+          "<p>Prompt: " + escapeHtml(prompt) + "</p>" +
+          "<pre><code class=\"language-python\">print(&quot;hello&quot;)\n</code></pre>" +
+          "<ul><li>one</li><li>two</li></ul>";
+        footer.className = "response-footer gap complete";
+        stop.hidden = true;
+      }, 850);
+    });
+  </script>
+</body>
+</html>
