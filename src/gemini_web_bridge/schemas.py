@@ -35,6 +35,9 @@ class ChatCompletionRequest(BaseModel):
     n: int = 1
     tools: list[dict[str, Any]] | None = None
     functions: list[dict[str, Any]] | None = None
+    tool_choice: str | dict[str, Any] | None = None
+    parallel_tool_calls: bool = True
+    function_call: str | dict[str, Any] | None = None
     response_format: dict[str, Any] | None = None
     stop: str | list[str] | None = None
     max_tokens: int | None = None
@@ -62,5 +65,7 @@ class ResponsesRequest(BaseModel):
     stream: bool = False
     max_output_tokens: int | None = None
     tools: list[dict[str, Any]] | None = None
+    tool_choice: str | dict[str, Any] | None = None
+    parallel_tool_calls: bool = True
     previous_response_id: str | None = None
     store: bool = False

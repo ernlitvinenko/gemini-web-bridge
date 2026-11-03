@@ -26,6 +26,16 @@ from .schemas import (
     CompletionRequest,
     ResponsesRequest,
 )
+from .tools import (
+    ToolCall,
+    ToolSpec,
+    chat_tool_calls,
+    normalize_tool_choice,
+    parse_tool_calls,
+    parse_tool_specs,
+    response_function_item,
+    validate_tool_calls,
+)
 
 router = APIRouter(prefix="/v1", dependencies=[Depends(require_api_key)])
 
@@ -58,13 +68,57 @@ def _model_and_target(settings: Settings, requested: str) -> tuple[str, str | No
 def _reject_tools(tools: list[dict[str, Any]] | None, label: str = "tools") -> None:
     if tools:
         raise BridgeError(
-            f"`{label}` is not supported: this bridge talks to Gemini's web UI, "
-            "which has no function-calling API. Remove tool definitions.",
+            f"`{label}` is disabled by GEMINI_BRIDGE_TOOL_CALLING=off. "
+            "Set it to `emulated` to use prompt-based tool calling.",
             status_code=400,
             code="unsupported_tools",
             error_type="invalid_request_error",
             param=label,
         )
+
+
+def _tool_specs(
+    settings: Settings,
+    tools: list[dict[str, Any]] | None,
+    functions: list[dict[str, Any]] | None = None,
+) -> list[ToolSpec]:
+    if settings.tool_calling == "off":
+        _reject_tools(tools)
+        _reject_tools(functions, "functions")
+        return []
+    return parse_tool_specs(tools, functions, max_tools=settings.max_tools)
+
+
+def _effective_tool_choice(tool_choice: Any, function_call: Any = None) -> Any:
+    if tool_choice is not None:
+        return tool_choice
+    return function_call
+
+
+def _tool_mode(specs: list[ToolSpec], tool_choice: Any) -> bool:
+    if not specs:
+        return False
+    mode, _ = normalize_tool_choice(tool_choice, specs)
+    return mode != "none"
+
+
+def _extract_tool_calls(
+    text: str,
+    specs: list[ToolSpec],
+    *,
+    tool_choice: Any,
+    parallel_tool_calls: bool,
+    max_calls: int,
+) -> list[ToolCall] | None:
+    if not _tool_mode(specs, tool_choice):
+        return None
+    calls = parse_tool_calls(text, specs, max_calls=max_calls)
+    return validate_tool_calls(
+        calls,
+        tool_choice=tool_choice,
+        specs=specs,
+        parallel_tool_calls=parallel_tool_calls,
+    )
 
 
 async def _collect(
@@ -195,8 +249,9 @@ async def bridge_status(request: Request) -> dict[str, Any]:
 async def chat_completions(request: Request, body: ChatCompletionRequest) -> Any:
     settings = _settings(request)
     driver = _driver(request)
-    _reject_tools(body.tools)
-    _reject_tools(body.functions, "functions")
+    specs = _tool_specs(settings, body.tools, body.functions)
+    tool_choice = _effective_tool_choice(body.tool_choice, body.function_call)
+    tool_mode = _tool_mode(specs, tool_choice)
     if body.n != 1:
         raise BridgeError(
             "Only n=1 is supported.",
@@ -207,7 +262,13 @@ async def chat_completions(request: Request, body: ChatCompletionRequest) -> Any
         )
 
     model, _ = _model_and_target(settings, body.model)
-    prompt = build_prompt(body.messages, body.response_format)
+    prompt = build_prompt(
+        body.messages,
+        body.response_format,
+        tools=specs,
+        tool_choice=tool_choice,
+        parallel_tool_calls=body.parallel_tool_calls,
+    )
     completion_id = "chatcmpl-" + uuid.uuid4().hex
     created = int(time.time())
     include_usage = bool((body.stream_options or {}).get("include_usage"))
@@ -215,6 +276,34 @@ async def chat_completions(request: Request, body: ChatCompletionRequest) -> Any
     if not body.stream:
         text, _actual = await _collect(driver, prompt, model)
         text = unwrap_json_fences(text, body.response_format)
+        calls = _extract_tool_calls(
+            text,
+            specs,
+            tool_choice=tool_choice,
+            parallel_tool_calls=body.parallel_tool_calls,
+            max_calls=settings.max_tool_calls,
+        )
+        if calls:
+            return {
+                "id": completion_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": model,
+                "system_fingerprint": "gemini-web-bridge",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": chat_tool_calls(calls),
+                        },
+                        "logprobs": None,
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": _usage(prompt, text),
+            }
         if not text:
             raise BridgeError(
                 "Gemini returned an empty answer.",
@@ -244,6 +333,110 @@ async def chat_completions(request: Request, body: ChatCompletionRequest) -> Any
             ],
             "usage": usage,
         }
+
+    if tool_mode:
+        text, _actual = await _collect(driver, prompt, model)
+        text = unwrap_json_fences(text, body.response_format)
+        calls = _extract_tool_calls(
+            text,
+            specs,
+            tool_choice=tool_choice,
+            parallel_tool_calls=body.parallel_tool_calls,
+            max_calls=settings.max_tool_calls,
+        )
+        if not text and not calls:
+            raise BridgeError(
+                "Gemini returned an empty answer.",
+                status_code=502,
+                code="empty_response",
+                error_type="api_error",
+            )
+
+        async def tool_event_stream() -> AsyncIterator[str]:
+            yield _sse(
+                _chat_chunk(
+                    completion_id=completion_id,
+                    created=created,
+                    model=model,
+                    delta={"role": "assistant", "content": None},
+                )
+            )
+            if calls:
+                for index, call in enumerate(calls):
+                    yield _sse(
+                        _chat_chunk(
+                            completion_id=completion_id,
+                            created=created,
+                            model=model,
+                            delta={
+                                "tool_calls": [
+                                    {
+                                        "index": index,
+                                        "id": call.id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": call.name,
+                                            "arguments": "",
+                                        },
+                                    }
+                                ]
+                            },
+                        )
+                    )
+                    yield _sse(
+                        _chat_chunk(
+                            completion_id=completion_id,
+                            created=created,
+                            model=model,
+                            delta={
+                                "tool_calls": [
+                                    {
+                                        "index": index,
+                                        "function": {"arguments": call.arguments},
+                                    }
+                                ]
+                            },
+                        )
+                    )
+                finish_reason = "tool_calls"
+            else:
+                if text:
+                    yield _sse(
+                        _chat_chunk(
+                            completion_id=completion_id,
+                            created=created,
+                            model=model,
+                            delta={"content": text},
+                        )
+                    )
+                finish_reason = "stop"
+
+            yield _sse(
+                _chat_chunk(
+                    completion_id=completion_id,
+                    created=created,
+                    model=model,
+                    finish_reason=finish_reason,
+                )
+            )
+            if include_usage:
+                yield _sse(
+                    {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [],
+                        "usage": _usage(prompt, text),
+                    }
+                )
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(
+            tool_event_stream(),
+            media_type="text/event-stream; charset=utf-8",
+            headers=SSE_HEADERS,
+        )
 
     generator, first = await _first_chunk(driver, prompt, model)
 
@@ -469,6 +662,9 @@ def _response_payload(
     max_output_tokens: int | None,
     temperature: float | None,
     top_p: float | None,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: Any = "auto",
+    parallel_tool_calls: bool = True,
 ) -> dict[str, Any]:
     return {
         "id": response_id,
@@ -482,14 +678,14 @@ def _response_payload(
         "max_output_tokens": max_output_tokens,
         "model": model,
         "output": output,
-        "parallel_tool_calls": True,
+        "parallel_tool_calls": parallel_tool_calls,
         "previous_response_id": None,
         "reasoning": {"effort": None, "summary": None},
         "store": False,
         "temperature": temperature,
         "text": {"format": {"type": "text"}},
-        "tool_choice": "auto",
-        "tools": [],
+        "tool_choice": tool_choice if tool_choice is not None else "auto",
+        "tools": tools or [],
         "top_p": top_p,
         "truncation": "disabled",
         "usage": usage,
@@ -501,7 +697,14 @@ def _response_payload(
 async def responses(request: Request, body: ResponsesRequest) -> Any:
     settings = _settings(request)
     driver = _driver(request)
-    _reject_tools(body.tools)
+    specs = _tool_specs(settings, body.tools)
+    tool_choice = _effective_tool_choice(body.tool_choice)
+    tool_mode = _tool_mode(specs, tool_choice)
+    tool_payload = {
+        "tools": body.tools or [],
+        "tool_choice": tool_choice if tool_choice is not None else "auto",
+        "parallel_tool_calls": body.parallel_tool_calls,
+    }
     if body.previous_response_id:
         raise BridgeError(
             "`previous_response_id` is not supported; send the full conversation in `input`.",
@@ -512,7 +715,13 @@ async def responses(request: Request, body: ResponsesRequest) -> Any:
         )
 
     model, _ = _model_and_target(settings, body.model)
-    prompt = build_prompt_from_responses(body.input, body.instructions)
+    prompt = build_prompt_from_responses(
+        body.input,
+        body.instructions,
+        tools=specs,
+        tool_choice=tool_choice,
+        parallel_tool_calls=body.parallel_tool_calls,
+    )
     response_id = "resp_" + uuid.uuid4().hex
     message_id = "msg_" + uuid.uuid4().hex
     created_at = int(time.time())
@@ -521,6 +730,28 @@ async def responses(request: Request, body: ResponsesRequest) -> Any:
 
     if not body.stream:
         text, _actual = await _collect(driver, prompt, model)
+        calls = _extract_tool_calls(
+            text,
+            specs,
+            tool_choice=tool_choice,
+            parallel_tool_calls=body.parallel_tool_calls,
+            max_calls=settings.max_tool_calls,
+        )
+        if calls:
+            output = [response_function_item(call) for call in calls]
+            return _response_payload(
+                response_id=response_id,
+                model=model,
+                created_at=created_at,
+                status="completed",
+                output=output,
+                usage=_responses_usage(prompt, text),
+                instructions=body.instructions,
+                max_output_tokens=body.max_output_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                **tool_payload,
+            )
         if not text:
             raise BridgeError(
                 "Gemini returned an empty answer.",
@@ -549,9 +780,125 @@ async def responses(request: Request, body: ResponsesRequest) -> Any:
             max_output_tokens=body.max_output_tokens,
             temperature=temperature,
             top_p=top_p,
+            **tool_payload,
         )
 
-    generator, first = await _first_chunk(driver, prompt, model)
+    if tool_mode:
+        buffered_text, _actual = await _collect(driver, prompt, model)
+        buffered_calls = _extract_tool_calls(
+            buffered_text,
+            specs,
+            tool_choice=tool_choice,
+            parallel_tool_calls=body.parallel_tool_calls,
+            max_calls=settings.max_tool_calls,
+        )
+        if not buffered_text and not buffered_calls:
+            raise BridgeError(
+                "Gemini returned an empty answer.",
+                status_code=502,
+                code="empty_response",
+                error_type="api_error",
+            )
+
+        if buffered_calls:
+            buffered_usage = _responses_usage(prompt, buffered_text)
+
+            def buffered_response(status: str, output: list[dict[str, Any]]) -> dict:
+                return _response_payload(
+                    response_id=response_id,
+                    model=model,
+                    created_at=created_at,
+                    status=status,
+                    output=output,
+                    usage=buffered_usage if status == "completed" else None,
+                    instructions=body.instructions,
+                    max_output_tokens=body.max_output_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    **tool_payload,
+                )
+
+            async def tool_event_stream() -> AsyncIterator[str]:
+                try:
+                    yield _sse(
+                        {
+                            "type": "response.created",
+                            "response": buffered_response("in_progress", []),
+                        },
+                        "response.created",
+                    )
+                    output: list[dict[str, Any]] = []
+                    for index, call in enumerate(buffered_calls):
+                        item = response_function_item(call)
+                        yield _sse(
+                            {
+                                "type": "response.output_item.added",
+                                "output_index": index,
+                                "item": {
+                                    **item,
+                                    "status": "in_progress",
+                                    "arguments": "",
+                                },
+                            },
+                            "response.output_item.added",
+                        )
+                        yield _sse(
+                            {
+                                "type": "response.function_call_arguments.delta",
+                                "item_id": item["id"],
+                                "output_index": index,
+                                "delta": call.arguments,
+                            },
+                            "response.function_call_arguments.delta",
+                        )
+                        yield _sse(
+                            {
+                                "type": "response.function_call_arguments.done",
+                                "item_id": item["id"],
+                                "output_index": index,
+                                "arguments": call.arguments,
+                            },
+                            "response.function_call_arguments.done",
+                        )
+                        yield _sse(
+                            {
+                                "type": "response.output_item.done",
+                                "output_index": index,
+                                "item": item,
+                            },
+                            "response.output_item.done",
+                        )
+                        output.append(item)
+
+                    yield _sse(
+                        {
+                            "type": "response.completed",
+                            "response": buffered_response("completed", output),
+                        },
+                        "response.completed",
+                    )
+                except BridgeError as exc:
+                    failed = buffered_response("failed", [])
+                    failed["error"] = {"code": exc.code, "message": exc.message}
+                    yield _sse(
+                        {"type": "response.failed", "response": failed},
+                        "response.failed",
+                    )
+
+            return StreamingResponse(
+                tool_event_stream(),
+                media_type="text/event-stream; charset=utf-8",
+                headers=SSE_HEADERS,
+            )
+
+        async def buffered_stream() -> AsyncIterator[GenerationChunk]:
+            if False:  # pragma: no cover - makes this an async generator
+                yield GenerationChunk(text="", model=model)
+
+        generator = buffered_stream()
+        first = GenerationChunk(text=buffered_text, model=model)
+    else:
+        generator, first = await _first_chunk(driver, prompt, model)
 
     async def event_stream() -> AsyncIterator[str]:
         full_text = first.text
@@ -567,6 +914,7 @@ async def responses(request: Request, body: ResponsesRequest) -> Any:
             max_output_tokens=body.max_output_tokens,
             temperature=temperature,
             top_p=top_p,
+            **tool_payload,
         )
         output_item = {
             "id": message_id,
@@ -686,6 +1034,7 @@ async def responses(request: Request, body: ResponsesRequest) -> Any:
                 max_output_tokens=body.max_output_tokens,
                 temperature=temperature,
                 top_p=top_p,
+                **tool_payload,
             )
             yield _sse(
                 {"type": "response.completed", "response": completed},
@@ -703,6 +1052,7 @@ async def responses(request: Request, body: ResponsesRequest) -> Any:
                 max_output_tokens=body.max_output_tokens,
                 temperature=temperature,
                 top_p=top_p,
+                **tool_payload,
             )
             failed["error"] = {
                 "code": exc.code,
@@ -724,6 +1074,7 @@ async def responses(request: Request, body: ResponsesRequest) -> Any:
                 max_output_tokens=body.max_output_tokens,
                 temperature=temperature,
                 top_p=top_p,
+                **tool_payload,
             )
             failed["error"] = {"code": "stream_error", "message": str(exc)}
             yield _sse(

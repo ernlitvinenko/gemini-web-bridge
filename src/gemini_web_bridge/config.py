@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -58,6 +59,10 @@ class Settings(BaseSettings):
     poll_interval_ms: int = 250
     page_timeout_ms: int = 15000
     max_prompt_chars: int = 200_000
+
+    tool_calling: Literal["off", "emulated"] = "emulated"
+    max_tools: int = 128
+    max_tool_calls: int = 8
 
     log_level: str = "INFO"
     debug_artifacts: bool = True

@@ -196,15 +196,267 @@ def test_unknown_model(client) -> None:
     assert response.json()["error"]["code"] == "model_unavailable"
 
 
-def test_tools_are_rejected(client) -> None:
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the weather for a city",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    }
+]
+
+TOOL_CALL_TEXT = (
+    '<tool_call>{"name": "get_weather", "arguments": {"city": "Paris"}}</tool_call>'
+)
+
+
+def test_chat_tool_call_is_emulated(client) -> None:
+    client.driver.text = TOOL_CALL_TEXT
     response = client.post(
         "/v1/chat/completions",
         json={
             "model": "gemini-web",
-            "messages": [{"role": "user", "content": "Hi"}],
-            "tools": [{"type": "function", "function": {"name": "x"}}],
+            "messages": [{"role": "user", "content": "Weather in Paris?"}],
+            "tools": TOOLS,
         },
     )
+    assert response.status_code == 200
+    payload = response.json()
+    choice = payload["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["content"] is None
+    call = choice["message"]["tool_calls"][0]
+    assert call["type"] == "function"
+    assert call["id"].startswith("call_")
+    assert call["function"]["name"] == "get_weather"
+    assert json.loads(call["function"]["arguments"]) == {"city": "Paris"}
+
+    prompt, _ = client.driver.prompts[0]
+    assert "TOOLS:" in prompt
+    assert "TOOL CALL PROTOCOL:" in prompt
+
+
+def test_chat_tool_call_streams_arguments(client) -> None:
+    client.driver.text = TOOL_CALL_TEXT
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "model": "gemini-web",
+            "messages": [{"role": "user", "content": "Weather in Paris?"}],
+            "tools": TOOLS,
+            "stream": True,
+        },
+    ) as response:
+        assert response.status_code == 200
+        lines = [line for line in response.iter_lines() if line.startswith("data:")]
+
+    chunks = [json.loads(line[6:]) for line in lines[:-1]]
+    deltas = [
+        delta
+        for chunk in chunks
+        for delta in chunk["choices"][0]["delta"].get("tool_calls", [])
+    ]
+    assert deltas[0]["index"] == 0
+    assert deltas[0]["function"]["name"] == "get_weather"
+    assert deltas[0]["function"]["arguments"] == ""
+    assert json.loads(deltas[1]["function"]["arguments"]) == {"city": "Paris"}
+    assert chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_chat_tool_result_is_rendered_in_prompt(client) -> None:
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gemini-web",
+            "messages": [
+                {"role": "user", "content": "Weather in Paris?"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": '{"city": "Paris"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": '{"temperature": 21}',
+                },
+            ],
+            "tools": TOOLS,
+        },
+    )
+    assert response.status_code == 200
+    prompt, _ = client.driver.prompts[0]
+    assert "ASSISTANT TOOL CALLS:" in prompt
+    assert 'TOOL RESULT (call_1):\n{"temperature": 21}' in prompt
+
+
+def test_responses_tool_call_is_emulated(client) -> None:
+    client.driver.text = TOOL_CALL_TEXT
+    flat_tools = [
+        {
+            "type": "function",
+            "name": "get_weather",
+            "description": "Get the weather for a city",
+            "parameters": {"type": "object"},
+        }
+    ]
+    response = client.post(
+        "/v1/responses",
+        json={
+            "model": "gemini-web",
+            "input": "Weather in Paris?",
+            "tools": flat_tools,
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    item = payload["output"][0]
+    assert item["type"] == "function_call"
+    assert item["status"] == "completed"
+    assert item["call_id"].startswith("call_")
+    assert item["name"] == "get_weather"
+    assert json.loads(item["arguments"]) == {"city": "Paris"}
+    assert payload["tools"] == flat_tools
+
+
+def test_responses_tool_call_stream(client) -> None:
+    client.driver.text = TOOL_CALL_TEXT
+    with client.stream(
+        "POST",
+        "/v1/responses",
+        json={
+            "model": "gemini-web",
+            "input": "Weather in Paris?",
+            "tools": TOOLS,
+            "stream": True,
+        },
+    ) as response:
+        assert response.status_code == 200
+        lines = [line for line in response.iter_lines() if line]
+
+    events = [line[7:] for line in lines if line.startswith("event: ")]
+    assert "response.output_item.added" in events
+    assert "response.function_call_arguments.done" in events
+    assert "response.completed" in events
+
+    data = [json.loads(line[6:]) for line in lines if line.startswith("data: ")]
+    done = next(
+        item for item in data if item["type"] == "response.function_call_arguments.done"
+    )
+    assert json.loads(done["arguments"]) == {"city": "Paris"}
+    completed = next(item for item in data if item["type"] == "response.completed")
+    assert completed["response"]["output"][0]["type"] == "function_call"
+
+
+def test_chat_tool_mode_falls_back_to_text(client) -> None:
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "model": "gemini-web",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "tools": TOOLS,
+            "stream": True,
+        },
+    ) as response:
+        assert response.status_code == 200
+        lines = [line for line in response.iter_lines() if line.startswith("data:")]
+
+    chunks = [json.loads(line[6:]) for line in lines[:-1]]
+    text = "".join(
+        chunk["choices"][0]["delta"].get("content") or ""
+        for chunk in chunks
+        if chunk.get("choices")
+    )
+    assert text == "Hello world"
+    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+
+
+def test_responses_tool_mode_falls_back_to_text(client) -> None:
+    with client.stream(
+        "POST",
+        "/v1/responses",
+        json={
+            "model": "gemini-web",
+            "input": "Hi",
+            "tools": TOOLS,
+            "stream": True,
+        },
+    ) as response:
+        assert response.status_code == 200
+        lines = [line for line in response.iter_lines() if line]
+
+    data = [json.loads(line[6:]) for line in lines if line.startswith("data: ")]
+    deltas = [
+        item["delta"] for item in data if item["type"] == "response.output_text.delta"
+    ]
+    assert "".join(deltas) == "Hello world"
+
+
+def test_responses_tool_result_is_rendered_in_prompt(client) -> None:
+    response = client.post(
+        "/v1/responses",
+        json={
+            "model": "gemini-web",
+            "input": [
+                {"type": "message", "role": "user", "content": "Weather in Paris?"},
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "get_weather",
+                    "arguments": '{"city": "Paris"}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": '{"temperature": 21}',
+                },
+            ],
+            "tools": TOOLS,
+        },
+    )
+    assert response.status_code == 200
+    prompt, _ = client.driver.prompts[0]
+    assert "ASSISTANT TOOL CALLS:" in prompt
+    assert 'TOOL RESULT (call_1):\n{"temperature": 21}' in prompt
+
+
+def test_tools_can_be_disabled(tmp_path) -> None:
+    settings = Settings(
+        _env_file=None,
+        tool_calling="off",
+        profile_dir=tmp_path / "profile",
+        debug_dir=tmp_path / "debug",
+        default_model="gemini-web",
+        model_map={"gemini-web": None},
+        debug_artifacts=False,
+    )
+    app = create_app(settings=settings, driver=FakeDriver())
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gemini-web",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "tools": TOOLS,
+            },
+        )
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "unsupported_tools"
 

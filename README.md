@@ -19,7 +19,7 @@ OpenAI-совместимый HTTP-сервер, который принимае
 | История сообщений | Передаётся в одном промпте, новый чат на каждый запрос |
 | Streaming | Да, по мере роста текста в DOM |
 | Markdown / code fences | Да, DOM конвертируется в Markdown |
-| Function calling / tools | Нет |
+| Function calling / tools | Экспериментально; текущий протокол `<tool_call>` не работает в Gemini Web (см. ниже) |
 | Изображения, аудио, файлы | Нет |
 | Точный подсчёт токенов | Нет, оценка по символам |
 | Параллельные запросы | Нет, один браузер и очередь (concurrency = 1) |
@@ -109,6 +109,9 @@ GEMINI_BRIDGE_DEFAULT_MODEL=gemini-web-pro
 | `GEMINI_BRIDGE_RESPONSE_START_TIMEOUT_S` | `120` | Сколько ждать начала ответа |
 | `GEMINI_BRIDGE_STABILITY_MS` | `1500` | Сколько текст должен не меняться, чтобы считать ответ готовым |
 | `GEMINI_BRIDGE_MAX_PROMPT_CHARS` | `200000` | Лимит размера промпта |
+| `GEMINI_BRIDGE_TOOL_CALLING` | `emulated` | `emulated` — tool calling через промпт; `off` — отклонять запросы с `tools` |
+| `GEMINI_BRIDGE_MAX_TOOLS` | `128` | Максимум определений инструментов в запросе |
+| `GEMINI_BRIDGE_MAX_TOOL_CALLS` | `8` | Максимум tool call в одном ответе Gemini |
 | `GEMINI_BRIDGE_DEBUG_ARTIFACTS` | `true` | Сохранять screenshot при ошибках |
 
 ### Модели
@@ -219,6 +222,88 @@ const response = await client.chat.completions.create({
 console.log(response.choices[0].message.content);
 ```
 
+### Tool calling (эмуляция)
+
+У Gemini Web нет нативного function calling, поэтому мост эмулирует его через промпт. Определения инструментов и строгий текстовый протокол добавляются в запрос, а ответ Gemini парсится обратно в обычный OpenAI-формат. **Инструменты выполняет ваш клиент** — сервер ничего не запускает и не делает повторных запросов.
+
+> **Известная проблема.** Gemini Web не принимает промпты, содержащие тег `<tool_call>`: запрос зависает в состоянии «думает» или возвращает `I encountered an error` / `Sorry, something went wrong`. Тот же запрос с обычным JSON без такого тега обрабатывается нормально. Поэтому текущая эмуляция tool calling через `<tool_call>` на веб-интерфейсе фактически нерабочая; протокол будет заменён на маркер без угловых скобок. `GEMINI_BRIDGE_TOOL_CALLING=off` не поможет клиентам, которые всегда отправляют `tools` (например, DeepSeek Harness): они получат 400 `unsupported_tools`. До переработки протокола отключите инструменты на стороне клиента, если это возможно.
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="sk-local-change-me")
+
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Узнать погоду в городе",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    }
+]
+
+response = client.chat.completions.create(
+    model="gemini-web-pro",
+    messages=[{"role": "user", "content": "Какая погода в Париже?"}],
+    tools=tools,
+    tool_choice="auto",
+)
+
+choice = response.choices[0]
+if choice.finish_reason == "tool_calls":
+    for call in choice.message.tool_calls:
+        print(call.function.name, call.function.arguments)
+```
+
+Поддерживаются:
+
+- Chat Completions, non-streaming и streaming (`finish_reason="tool_calls"`, дельты `tool_calls`);
+- Responses API, non-streaming и streaming (`function_call` items и события `response.function_call_arguments.*`);
+- `tool_choice`: `auto`, `none`, `required`/`any`, либо `{"type": "function", "function": {"name": ...}}`;
+- `parallel_tool_calls` (при `false` сервер отклонит несколько вызовов в одном ответе);
+- определения инструментов как во вложенном формате Chat Completions, так и в плоском формате Responses API;
+- история с `assistant.tool_calls` и `tool`-сообщениями: результаты инструментов передаются Gemini в следующем запросе.
+
+Ограничения эмуляции:
+
+- Gemini может не вызвать инструмент, даже если он объявлен. `tool_choice="required"` превращается в инструкцию, а не в жёсткую гарантию.
+- Аргументы не валидируются по JSON Schema — проверяйте их на стороне клиента.
+- Streaming в режиме инструментов буферизуется: сервер сначала дожидается полного ответа, чтобы не отдать клиенту частичный `<tool_call>`. Обычный текстовый streaming не меняется.
+- `GEMINI_BRIDGE_TOOL_CALLING=off` возвращает прежнее поведение: запросы с `tools`/`functions` отклоняются с кодом `unsupported_tools`.
+
+### DeepSeek Harness
+
+DSH подключается как обычный OpenAI-совместимый провайдер. В `cordis.patch.yml` профиля DSH:
+
+```yaml
+- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      gemini-web-bridge:
+        displayName: Gemini Web Bridge
+        api: openai-completions
+        baseURL: http://127.0.0.1:8000/v1
+        apiKeyEnv: GEMINI_WEB_BRIDGE_API_KEY
+        models:
+          - id: gemini-web-auto
+            name: gemini-web-auto
+            contextWindow: 200000
+```
+
+Затем выберите провайдера `gemini-web-bridge` и модель `gemini-web-auto` в настройках DSH.
+
+- Используйте протокол `openai-completions`: обычный стриминг работает. Tool calling пока не работает из-за проблемы с `<tool_call>` выше. `openai-responses` тоже поддерживается, но Chat Completions проверен с DSH лучше.
+- Переменная из `apiKeyEnv` должна быть задана и непустая. Если у моста `GEMINI_BRIDGE_API_KEY` пустой, подойдёт любое значение-заглушка; если задан — укажите тот же ключ.
+- DSH по умолчанию отправляет около 38 определений инструментов. Начиная с этой версии лимит моста — 128; для большего числа инструментов увеличьте `GEMINI_BRIDGE_MAX_TOOLS`.
+- После изменения `.env` или кода моста перезапустите сервер, а после правки конфигурации — DSH.
+
 ## API
 
 - `GET /health` — статус сервиса и браузера; не требует ключ.
@@ -241,7 +326,7 @@ console.log(response.choices[0].message.content);
 }
 ```
 
-Основные коды: `gemini_login_required`, `captcha_required`, `gemini_timeout`, `gemini_busy`, `browser_start_failed`, `model_unavailable`, `unsupported_tools`, `prompt_too_large`.
+Основные коды: `gemini_login_required`, `captcha_required`, `gemini_timeout`, `gemini_busy`, `browser_start_failed`, `model_unavailable`, `unsupported_tools`, `tool_call_invalid`, `tool_call_required`, `tool_call_limit`, `invalid_tool_name`, `prompt_too_large`.
 
 ## Как это работает внутри
 
@@ -261,7 +346,7 @@ console.log(response.choices[0].message.content);
 - **Веб-подписка ≠ API-квота.** Лимиты веб-интерфейса действуют как в обычном чате; при частых запросах возможны rate limit и предупреждения Google.
 - **Токены считаются приблизительно** (`len(text)/4`). Не используйте эти цифры для биллинга.
 - **Параметры `temperature`, `top_p`, `max_tokens`, `stop`, `logprobs` игнорируются** веб-интерфейсом. `response_format=json_object/json_schema` добавляет инструкцию и снимает Markdown-ограждение с ответа, но гарантии валидного JSON нет.
-- **Инструменты не поддерживаются.** Запрос с `tools`/`function_call` завершится ошибкой 400, чтобы клиент не завис в ожидании tool call.
+- **Инструменты эмулируются через промпт и пока не работают в Gemini Web.** Нативного function calling у Gemini Web нет, а тег `<tool_call>` приводит к зависанию или ошибке веб-интерфейса. До переработки протокола отключите `tools` на стороне клиента. См. раздел «Tool calling».
 - **Контекст диалога.** Каждый API-запрос — новый чат; история передаётся в промпте. `previous_response_id` в Responses API не поддерживается.
 - **Приватность.** Промпты и ответы обрабатываются локальным Chrome, но уходят в Google как обычные сообщения Gemini. Логи сервера не содержат текст промптов.
 
@@ -276,8 +361,9 @@ uv run pytest -q
 
 Тесты:
 
-- `tests/test_api.py` — OpenAI-эндпоинты на fake-драйвере, стриминг, auth, ошибки.
+- `tests/test_api.py` — OpenAI-эндпоинты на fake-драйвере, стриминг, tool calling, auth, ошибки.
 - `tests/test_prompting.py` — сборка промпта, content parts, JSON-режим.
+- `tests/test_tools.py` — парсинг tool definitions, `<tool_call>`, `tool_choice` и лимиты.
 - `tests/test_browser_driver.py` — реальный Playwright на локальной mock-странице Gemini: ввод, выбор Pro, ожидание, Markdown. Требует установленный Chrome; иначе тест пропускается.
 
 ## Безопасность
