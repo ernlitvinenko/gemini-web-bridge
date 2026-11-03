@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import pytest
 
-from app.errors import BridgeError
-from app.prompting import (
+from gemini_web_bridge.errors import BridgeError
+from gemini_web_bridge.prompting import (
     build_prompt,
     build_prompt_from_responses,
     content_to_text,
     estimate_tokens,
 )
-from app.schemas import ChatMessage
+from gemini_web_bridge.schemas import ChatMessage
 
 
 def test_single_user_prompt_is_sent_verbatim() -> None:

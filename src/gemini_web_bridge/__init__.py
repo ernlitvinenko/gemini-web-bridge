@@ -15,7 +15,7 @@ def main() -> None:
     args = parser.parse_args()
     settings = Settings()
     uvicorn.run(
-        "app.main:app",
+        "gemini_web_bridge.main:app",
         host=settings.host,
         port=settings.port,
         reload=args.reload,

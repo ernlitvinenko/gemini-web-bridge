@@ -5,10 +5,10 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
-from app.config import Settings
-from app.errors import BridgeError
-from app.gemini_web import GenerationChunk
-from app.main import create_app
+from gemini_web_bridge.config import Settings
+from gemini_web_bridge.errors import BridgeError
+from gemini_web_bridge.gemini_web import GenerationChunk
+from gemini_web_bridge.main import create_app
 
 
 class FakeDriver:

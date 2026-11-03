@@ -5,9 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from app.config import Settings
-from app.errors import LoginRequired
-from app.gemini_web import GeminiWebDriver
+from gemini_web_bridge.config import Settings
+from gemini_web_bridge.errors import LoginRequired
+from gemini_web_bridge.gemini_web import GeminiWebDriver
 
 FIXTURE = Path(__file__).parent / "fixtures" / "gemini_mock.html"
 
