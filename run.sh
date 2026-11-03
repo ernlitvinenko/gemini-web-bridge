@@ -3,8 +3,8 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 if [[ ! -x ".venv/bin/python" ]]; then
-  echo "No .venv found. Run: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt" >&2
+  echo "No .venv found. Run: uv sync" >&2
   exit 1
 fi
 
-exec .venv/bin/python -m app "$@"
+exec .venv/bin/gemini-web-bridge "$@"

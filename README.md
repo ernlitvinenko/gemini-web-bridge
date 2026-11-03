@@ -48,7 +48,7 @@ gemini.google.com/app  (ваша веб-подписка Pro)
 ## Требования
 
 - macOS, Linux или Windows.
-- Python 3.11+.
+- Python 3.11+ and [uv](https://docs.astral.sh/uv/).
 - Google Chrome (по умолчанию используется установленный Chrome, а не bundled Chromium).
 - Аккаунт Google с Gemini Pro и доступом к веб-интерфейсу Gemini из вашей сети. Если Gemini недоступен напрямую, сначала настройте VPN/system proxy для Chrome.
 
@@ -56,9 +56,7 @@ gemini.google.com/app  (ваша веб-подписка Pro)
 
 ```bash
 cd gemini-web-bridge
-python3 -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+uv sync
 cp .env.example .env
 ```
 
@@ -75,13 +73,13 @@ playwright install chromium
 Сервер и helper используют отдельный профиль (`~/.gemini-web-bridge/profile` по умолчанию), а не ваш повседневный Chrome. Это важно: Playwright не любит, когда тот же профиль уже открыт другим Chrome.
 
 ```bash
-python -m app.login
+uv run gemini-web-bridge-login
 ```
 
 Откроется Chrome. Войдите в Google-аккаунт с Pro, пройдите 2FA, затем вернитесь в терминал и нажмите Enter. Проверить сессию без открытия окна:
 
 ```bash
-python -m app.login --check
+uv run gemini-web-bridge-login --check
 ```
 
 Не запускайте login helper одновременно с сервером: профиль может быть заблокирован. Если сервер уже работает, остановите его, выполните вход, затем запустите снова.
@@ -136,14 +134,14 @@ GEMINI_BRIDGE_MODEL_MAP={"gemini-web":null,"gemini-web-pro":"Pro","gemini-web-th
 ## 3. Запуск
 
 ```bash
-python -m app
+uv run gemini-web-bridge
 # или
 ./run.sh
 ```
 
 Сервер поднимется на `http://127.0.0.1:8000`. Swagger: http://127.0.0.1:8000/docs.
 
-Первый запрос запустит Chrome. Если окно не появилось или Gemini показывает логин, выполните `python -m app.login`. Браузер остаётся открытым между запросами; каждый запрос начинается с нового чата.
+Первый запрос запустит Chrome. Если окно не появилось или Gemini показывает логин, выполните `uv run gemini-web-bridge-login`. Браузер остаётся открытым между запросами; каждый запрос начинается с нового чата.
 
 ## Примеры
 
@@ -256,7 +254,7 @@ console.log(response.choices[0].message.content);
 ## Ограничения и подводные камни
 
 - **Один запрос за раз.** Это ограничение одного браузерного окна. Второй запрос ждёт освобождения блокировки; таймаут ожидания — `GEMINI_BRIDGE_LOCK_WAIT_TIMEOUT_S`.
-- **UI Gemini может измениться.** Селекторы вынесены в `app/gemini_web.py` и `app/extract.js`; при обновлении интерфейса их нужно править.
+- **UI Gemini может измениться.** Селекторы вынесены в `src/gemini_web_bridge/gemini_web.py` и `src/gemini_web_bridge/extract.js`; при обновлении интерфейса их нужно править.
 - **Deep Think / длинные ответы.** Увеличьте `GEMINI_BRIDGE_REQUEST_TIMEOUT_S` и `GEMINI_BRIDGE_RESPONSE_START_TIMEOUT_S`.
 - **Google может показать captcha.** Откройте окно Chrome, пройдите проверку, повторите запрос.
 - **Не используйте основной Chrome-профиль.** Playwright создаёт отдельный профиль; это защищает ваши куки и сессии.
@@ -270,9 +268,11 @@ console.log(response.choices[0].message.content);
 ## Разработка
 
 ```bash
-pip install -r requirements-dev.txt
-pytest -q
+uv sync --dev
+uv run pytest -q
 ```
+
+Проверка стиля: `uv run ruff check .` и `uv run ruff format --check .`.
 
 Тесты:
 
@@ -290,4 +290,4 @@ pytest -q
 
 ## Лицензия
 
-Код можно использовать и изменять свободно. Ответственность за соблюдение условий Google и локального законодательства остаётся на пользователе.
+Проект распространяется по лицензии MIT — см. [LICENSE](LICENSE). Ответственность за соблюдение условий Google и локального законодательства остаётся на пользователе.

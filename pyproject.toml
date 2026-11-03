@@ -1,12 +1,12 @@
 [project]
 name = "gemini-web-bridge"
 version = "0.1.0"
-description = "Add your description here"
+description = "OpenAI-compatible API bridge to the Gemini web interface"
 readme = "README.md"
 authors = [
     { name = "Ernest Litvinenko", email = "ernest@elitvinenko.tech" }
 ]
-requires-python = ">=3.14"
+requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115,<1",
     "playwright>=1.49,<2",
@@ -17,6 +17,7 @@ dependencies = [
 
 [project.scripts]
 gemini-web-bridge = "gemini_web_bridge:main"
+gemini-web-bridge-login = "gemini_web_bridge.login:main"
 
 [build-system]
 requires = ["uv_build>=0.13.6,<0.14.0"]

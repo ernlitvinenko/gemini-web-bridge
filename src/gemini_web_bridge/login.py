@@ -104,7 +104,7 @@ def main() -> None:
             print()
             try:
                 input("Press Enter when you are signed in... ")
-            except EOFError, KeyboardInterrupt:
+            except (EOFError, KeyboardInterrupt):
                 print("\nCancelled.")
                 context.close()
                 raise SystemExit(130)
